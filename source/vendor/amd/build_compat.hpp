@@ -1,0 +1,5 @@
+#include <d3d11.h>
+#include <locale>
+#include <mmsystem.h>
+static const GUID ProofDebugNameW={0x4cca5fd8,0x921f,0x42c8,{0x85,0x66,0x70,0xca,0xf2,0xa9,0xb7,0x41}};
+#define WKPDID_D3DDebugObjectNameW ProofDebugNameW

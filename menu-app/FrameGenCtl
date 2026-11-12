@@ -1,0 +1,317 @@
+#!/bin/zsh -f
+set -eu
+
+fail() { print -u2 -r -- "$1"; exit 1; }
+line() { [[ "$1" != *[$'\t\r\n']* ]]; }
+
+resources=${0:A:h}
+crossover_home="$HOME/Library/Application Support/CrossOver"
+runtime_key='HKLM\Software\Khronos\OpenXR\1'
+implicit_key="$runtime_key\ApiLayers\Implicit"
+win_manifest='C:\FrameGen\FrameGen.json'
+layer_name='XR_APILAYER_ARMAX_framegen'
+
+crossovers() {
+  local directory app wine_path
+  for directory in /Applications "$HOME/Applications"; do
+    for app in "$directory/CrossOver.app" "$directory/CrossOver Preview.app"; do
+      wine_path="$app/Contents/SharedSupport/CrossOver/bin/wine"
+      if [[ -x "$wine_path" ]]; then print -r -- "$app"; fi
+    done
+  done
+}
+
+typeset -a bottle_roots
+typeset -U bottle_roots
+configured_roots=${CX_BOTTLE_PATH:-}
+if [[ -z "$configured_roots" && -r "$crossover_home/CrossOver.conf" ]]; then
+  configured_roots=$(/usr/bin/awk '
+    /^\[/ { cross_over = ($0 == "[CrossOver]") }
+    cross_over && /^"BottlePath"[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*$/, ""); print; exit
+    }' "$crossover_home/CrossOver.conf")
+fi
+bottle_roots=("${(@s.:.)configured_roots}" "$crossover_home/Bottles")
+
+valid_bottle() { [[ -d "$1/drive_c" && -r "$1/cxbottle.conf" ]]; }
+
+bottles() {
+  local root entry name
+  typeset -A seen
+  for root in "${bottle_roots[@]}"; do
+    [[ "$root" == /* ]] || continue
+    for entry in "$root"/*(N); do
+      name=${entry:t}
+      if line "$name" && valid_bottle "$entry" && [[ -z ${seen[$name]:-} ]]; then
+        seen[$name]=1
+        print -r -- "$name"
+      fi
+    done
+  done
+}
+
+select_bottle() {
+  local root
+  [[ -n "$bottle" && "$bottle" != */* && "$bottle" != . && "$bottle" != .. ]] && line "$bottle" ||
+    fail 'Select a CrossOver bottle.'
+  for root in "${bottle_roots[@]}"; do
+    if [[ "$root" == /* ]] && valid_bottle "$root/$bottle"; then
+      prefix=${root%/}/$bottle
+      prefix=${prefix:A}
+      target="$prefix/drive_c/FrameGen"
+      return
+    fi
+  done
+  fail "CrossOver bottle not found: $bottle"
+}
+
+select_wine() {
+  local chosen
+  if [[ -z "$crossover" ]]; then
+    chosen=$(crossovers)
+    crossover=${chosen%%$'\n'*}
+  fi
+  [[ "$crossover" == /*.app ]] || fail 'CrossOver or CrossOver Preview was not found.'
+  wine="$crossover/Contents/SharedSupport/CrossOver/bin/wine"
+  [[ -x "$wine" ]] || fail "CrossOver executable not found in $crossover."
+}
+
+reg() (
+  unset WINEDLLOVERRIDES
+  "$wine" --bottle "$prefix" --scope private reg.exe "$@"
+)
+
+prepare_layout() {
+  local directory
+  for directory in "$target" "$target/status"; do
+    [[ ! -L "$directory" ]] || fail "Unexpected symbolic link: $directory"
+    /bin/mkdir -p "$directory"
+  done
+  [[ ! -L "$target/.ctl.lock" ]] || fail 'Unexpected FrameGen lock link.'
+  zmodload zsh/system
+  /usr/bin/touch "$target/.ctl.lock"
+  zsystem flock -t 10 "$target/.ctl.lock" || fail 'Another FrameGen change is in progress.'
+}
+
+manifest_owned() {
+  [[ -f "$1" && ! -L "$1" ]] &&
+    [[ $(/usr/bin/plutil -extract api_layer.name raw -o - "$1" 2>/dev/null) == "$layer_name" ]]
+}
+
+manifest_version() {
+  local value
+  value=$(/usr/bin/plutil -extract api_layer.implementation_version raw -o - "$1" 2>/dev/null) &&
+    [[ "$value" =~ '^[1-9][0-9]*$' ]] || return 1
+  print -r -- "$value"
+}
+
+registry_enabled() {
+  [[ -r "$prefix/system.reg" ]] || return 1
+  /usr/bin/awk '
+    /^\[/ {
+      implicit = (tolower($1) == "[software\\\\khronos\\\\openxr\\\\1\\\\apilayers\\\\implicit]")
+    }
+    implicit && tolower($0) == "\"c:\\\\framegen\\\\framegen.json\"=dword:00000000" {
+      found = 1
+      exit
+    }
+    END { exit !found }
+  ' "$prefix/system.reg"
+}
+
+install_layer() (
+  manifest_owned "$resources/FrameGen.json" && [[ -f "$resources/FrameGen.dll" ]] ||
+    fail 'This app is missing its FrameGen layer payload.'
+  local files_only=${1:-0}
+  if (( files_only )) && ! registry_enabled; then
+    fail 'FrameGen must already be registered to update without starting Wine.'
+  fi
+  prepare_layout
+  if [[ -e "$target/FrameGen.json" || -e "$target/FrameGen.dll" ||
+        -L "$target/FrameGen.json" || -L "$target/FrameGen.dll" ]]; then
+    manifest_owned "$target/FrameGen.json" &&
+      [[ ! -L "$target/FrameGen.dll" && ( ! -e "$target/FrameGen.dll" || -f "$target/FrameGen.dll" ) ]] ||
+      fail 'C:\FrameGen already contains an unrelated layer. Existing files were preserved.'
+  fi
+  local stage previous previous_value='' item replacing=0 registration_attempted=0 committed=0 registered=0
+  if registry_enabled; then
+    registered=1
+  elif (( files_only )); then
+    fail 'The FrameGen registration changed during the update.'
+  else
+    select_wine
+  fi
+  stage=$(/usr/bin/mktemp -d "$target/.install.XXXXXX")
+  cleanup_install() {
+    local result=$? file
+    trap - EXIT
+    if (( ! committed )); then
+      if (( registration_attempted )); then
+        if [[ -n "$previous_value" ]]; then
+          reg add "$implicit_key" /v "$win_manifest" /t REG_DWORD /d "$previous_value" /f >/dev/null ||
+            print -u2 -r -- 'Could not restore the previous FrameGen registry value.'
+        else
+          reg delete "$implicit_key" /v "$win_manifest" /f >/dev/null 2>&1 || true
+        fi
+      fi
+      if (( replacing )); then
+        for file in FrameGen.dll FrameGen.json; do
+          if [[ -f "$stage/prior-$file" ]]; then
+            /bin/mv -f "$stage/prior-$file" "$target/$file" ||
+              print -u2 -r -- "Could not restore $file from $stage."
+          else
+            /bin/rm -f "$target/$file"
+          fi
+        done
+      fi
+    fi
+    if (( committed || ! replacing )) || [[ ! -e "$stage/prior-FrameGen.dll" && ! -e "$stage/prior-FrameGen.json" ]]; then
+      /bin/rm -rf "$stage"
+    fi
+    exit "$result"
+  }
+  trap cleanup_install EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  for item in FrameGen.dll FrameGen.json; do
+    /usr/bin/install -m 0644 "$resources/$item" "$stage/$item"
+    if [[ -f "$target/$item" ]]; then /bin/cp -p "$target/$item" "$stage/prior-$item"; fi
+  done
+  if (( ! registered )) && previous=$(reg query "$implicit_key" /v "$win_manifest" 2>/dev/null); then
+    previous_value=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { print $NF; exit }')
+    [[ "$previous_value" =~ '^(0x[0-9a-fA-F]+|[0-9]+)$' ]] ||
+      fail 'An incompatible FrameGen registry value already exists.'
+  fi
+  replacing=1
+  /bin/mv -f "$stage/FrameGen.dll" "$target/FrameGen.dll"
+  /bin/mv -f "$stage/FrameGen.json" "$target/FrameGen.json"
+  if (( ! registered )); then
+    registration_attempted=1
+    reg add "$implicit_key" /v "$win_manifest" /t REG_DWORD /d 0 /f >/dev/null ||
+      fail 'Could not register the implicit OpenXR layer.'
+    previous=$(reg query "$implicit_key" /v "$win_manifest") ||
+      fail 'Could not verify the OpenXR registration.'
+    previous=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { print $NF; exit }')
+    [[ "$previous" =~ '^(0x)?0+$' ]] || fail 'Could not verify the enabled OpenXR registration.'
+  fi
+  committed=1
+  print -r -- "FrameGen installed in $bottle."
+)
+
+write_atomic() {
+  local destination=$1 content=$2 temp
+  [[ ! -L "$destination" && ! -d "$destination" ]] || fail "Unexpected FrameGen file: $destination"
+  temp=$(/usr/bin/mktemp "${destination:h}/.write.XXXXXX")
+  if ! printf '%s' "$content" > "$temp" || ! /bin/mv -f "$temp" "$destination"; then
+    /bin/rm -f "$temp"
+    fail "Could not save $destination."
+  fi
+}
+
+read_installation() {
+  local manifest="$target/FrameGen.json" library="$target/FrameGen.dll" registered=0
+  installation=partial installed_version=-
+  bundled_version=$(manifest_version "$resources/FrameGen.json") ||
+    fail 'This app is missing its FrameGen manifest version.'
+  if registry_enabled; then registered=1; fi
+  if [[ ! -e "$manifest" && ! -L "$manifest" && ! -e "$library" && ! -L "$library" ]] &&
+      (( ! registered )); then
+    installation=missing
+    return
+  fi
+  if manifest_owned "$manifest"; then
+    installed_version=$(manifest_version "$manifest") || installed_version=-
+  fi
+  [[ "$installed_version" != - && -f "$library" && ! -L "$library" ]] && (( registered )) ||
+    return 0
+  if [[ "$installed_version" != "$bundled_version" ]]; then
+    installation=outdated
+  elif /usr/bin/cmp -s "$manifest" "$resources/FrameGen.json" &&
+       /usr/bin/cmp -s "$library" "$resources/FrameGen.dll"; then
+    installation=current
+  fi
+}
+
+read_mode() {
+  mode=off
+  local value
+  [[ -f "$target/mode.txt" && ! -L "$target/mode.txt" ]] || return 0
+  value=$(<"$target/mode.txt") || return 0
+  if [[ "${value%$'\r'}" == on ]]; then mode=on; fi
+}
+
+read_activity() {
+  read_mode
+  runtime_state=idle game=- runtime_issue=-
+  [[ -d "$target/status" && ! -L "$target/status" ]] || return 0
+  zmodload zsh/datetime
+  zmodload zsh/stat
+  local status_file pid session_file state name issue extra stamp newest=-1
+  local -a times
+  local -A states names issues stamps
+  local -i now=$EPOCHSECONDS
+  for status_file in "$target/status/"*.txt(N.); do
+    session_file=${status_file:t:r}
+    [[ "$session_file" =~ '^[1-9][0-9]*(-[0-9]+)?$' ]] || continue
+    zstat -A times +mtime -- "$status_file" 2>/dev/null || continue
+    stamp=${times[1]}
+    (( stamp >= now - 3 && stamp <= now + 1 )) || continue
+    IFS=$'\t' read -r pid state name issue extra < "$status_file" 2>/dev/null || continue
+    [[ "$pid" == "${session_file%%-*}" && -n "$name" && -z "$extra" ]] && line "$name" || continue
+    [[ -z "$issue" || "$issue" =~ '^[a-z][a-z-]*:-?[0-9]+$' ]] || continue
+    case "$state" in active|waiting|unsupported|unsupported-d3d12|off) ;; *) continue ;; esac
+    if [[ ${states[$pid]:-} == active && "$state" != active ]]; then continue; fi
+    if [[ "${states[$pid]:-}" == "$state" ]] && (( stamp < ${stamps[$pid]:--1} )); then continue; fi
+    if [[ "$state" != active ]] && (( stamp < ${stamps[$pid]:--1} )); then continue; fi
+    states[$pid]=$state names[$pid]=$name issues[$pid]=${issue:--} stamps[$pid]=$stamp
+  done
+  for pid in "${(@k)states}"; do
+    stamp=${stamps[$pid]}
+    (( stamp >= newest )) || continue
+    if (( stamp == newest )) && [[ "$runtime_state" == active ]]; then continue; fi
+    newest=$stamp runtime_state=${states[$pid]} game=${names[$pid]} runtime_issue=${issues[$pid]}
+  done
+}
+
+operation=${1:-}
+[[ -n "$operation" ]] || fail 'Choose a FrameGen command.'
+shift
+bottle='' crossover='' requested_mode=''
+while (( $# )); do
+  (( $# >= 2 )) || fail "Missing value for $1."
+  case "$1" in
+    --bottle) bottle=$2 ;;
+    --crossover) crossover=$2 ;;
+    --mode) requested_mode=$2 ;;
+    *) fail "Unknown option: $1" ;;
+  esac
+  shift 2
+done
+
+case "$operation" in
+  bottles) bottles ;;
+  crossovers) crossovers ;;
+  install) select_bottle; install_layer ;;
+  update-files) select_bottle; install_layer 1 ;;
+  status)
+    select_bottle
+    read_installation
+    read_activity
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$installation" "$mode" "$runtime_state" "$game" "$installed_version" "$bundled_version" "$runtime_issue"
+    ;;
+  activity)
+    select_bottle
+    read_activity
+    printf '%s\t%s\t%s\t%s\n' "$mode" "$runtime_state" "$game" "$runtime_issue"
+    ;;
+  mode)
+    select_bottle
+    [[ "$requested_mode" == on || "$requested_mode" == off ]] || fail 'Choose FrameGen on or off.'
+    prepare_layout
+    read_installation
+    [[ "$installation" == current ]] || fail "Install the current FrameGen version in $bottle first."
+    write_atomic "$target/mode.txt" "$requested_mode"
+    print -r -- "$requested_mode"
+    ;;
+  *) fail "Unknown command: $operation" ;;
+esac

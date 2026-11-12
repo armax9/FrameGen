@@ -1,0 +1,198 @@
+diff --git a/sdk/src/backends/dx11/ffx_dx11.cpp b/sdk/src/backends/dx11/ffx_dx11.cpp
+index 30729dc..00c624c 100644
+--- a/sdk/src/backends/dx11/ffx_dx11.cpp
++++ b/sdk/src/backends/dx11/ffx_dx11.cpp
+@@ -73,6 +73,7 @@ typedef struct BackendContext_DX11 {
+ 
+     FfxGpuJobDescription*   pGpuJobs;
+     uint32_t                gpuJobCount;
++    FfxErrorCode            pendingJobError;
+ 
+     void*                   constantBufferMem[FFX_MAX_NUM_CONST_BUFFERS];
+     ID3D11Buffer*           constantBufferResource[FFX_MAX_NUM_CONST_BUFFERS];
+@@ -97,11 +98,16 @@ typedef struct BackendContext_DX11 {
+ 
+ } BackendContext_DX11;
+ 
++// Optical Flow queues 69 jobs on a reset (including transition barriers)
++// before executing them. The shared SDK's 64-job default is too small for
++// this backend's batch. Keep allocation and admission on the same bound.
++static constexpr uint32_t kDx11GpuJobsPerContext = 128;
++
+ FFX_API size_t ffxGetScratchMemorySizeDX11(size_t maxContexts)
+ {
+     uint32_t resourceArraySize   = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_DX11::Resource), sizeof(uint64_t));
+     uint32_t contextArraySize    = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_DX11::EffectContext), sizeof(uint32_t));
+-    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
++    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * kDx11GpuJobsPerContext * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+ 
+     return FFX_ALIGN_UP(sizeof(BackendContext_DX11) + resourceArraySize + contextArraySize + gpuJobDescArraySize, sizeof(uint64_t));
+ }
+@@ -177,7 +183,7 @@ FfxCommandList ffxGetCommandListDX11(ID3D11DeviceContext* deviceContext)
+ }
+ 
+ // register a DX11 resource to the backend
+-FfxResource ffxGetResourceDX11_Fsr31(ID3D11Resource* dx11Resource,
++FfxResource ffxGetResourceDX11_Fsr31(const ID3D11Resource* dx11Resource,
+     FfxResourceDescription                     ffxResDescription,
+     wchar_t const*                             ffxResName,
+     FfxResourceStates                          state /*=FFX_RESOURCE_STATE_COMPUTE_READ*/)
+@@ -484,6 +490,8 @@ FfxSurfaceFormat ffxGetSurfaceFormatDX11(DXGI_FORMAT format)
+         //case DXGI_FORMAT_R16G16_UNORM:
+         case (DXGI_FORMAT_R16G16_UINT):
+             return FFX_SURFACE_FORMAT_R16G16_UINT;
++        case DXGI_FORMAT_R16G16_SINT:
++            return FFX_SURFACE_FORMAT_R16G16_SINT;
+         //case DXGI_FORMAT_R16G16_SNORM
+         //case DXGI_FORMAT_R16G16_SINT 
+ 
+@@ -685,7 +693,7 @@ FfxErrorCode CreateBackendContextDX11(FfxInterface* backendInterface, FfxUInt32*
+         }
+ 
+         // Map all of our pointers
+-        uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
++        uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * kDx11GpuJobsPerContext * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+         uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_DX11::Resource), sizeof(uint64_t));
+         uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_DX11::EffectContext), sizeof(uint32_t));
+         uint8_t* pMem = (uint8_t*)((BackendContext_DX11*)(backendContext + 1));
+@@ -705,30 +713,9 @@ FfxErrorCode CreateBackendContextDX11(FfxInterface* backendInterface, FfxUInt32*
+         memset(backendContext->pEffectContexts, 0, contextArraySize);
+     }
+ 
+-    // Direct3D 11.1
+-    if (!backendContext->refCount && backendContext->deviceContext1 != NULL) {
+-
+-        std::lock_guard<std::mutex> cbLock{ backendContext->constantBufferMutex };
+-
+-        // create dynamic ring buffer for constant uploads
+-        backendContext->constantBufferSize[0] = FFX_ALIGN_UP(FFX_MAX_CONST_SIZE, 256) *
+-            backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES; // Size aligned to 256
+-
+-        D3D11_BUFFER_DESC constDesc = {};
+-        constDesc.ByteWidth = backendContext->constantBufferSize[0];
+-        constDesc.Usage = D3D11_USAGE_DYNAMIC;
+-        constDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+-        constDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+-        TIF(dx11Device->CreateBuffer(&constDesc, nullptr, &backendContext->constantBufferResource[0]));
+-        SetNameDX11(backendContext->constantBufferResource[0], L"FFX_DX11_DynamicRingBuffer");
+-
+-        // map it
+-        D3D11_MAPPED_SUBRESOURCE mappedSubresource = {};
+-        TIF(backendContext->deviceContext->Map(backendContext->constantBufferResource[0], 0,
+-            D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mappedSubresource));
+-        backendContext->constantBufferMem[0] = mappedSubresource.pData;
+-        backendContext->constantBufferOffset[0] = 0;
+-    }
++    // Upload constants with WRITE_DISCARD/Unmap for every dispatch below.
++    // A buffer left mapped while dispatched is not a valid D3D11 contract,
++    // even when ID3D11DeviceContext1 is available.
+ 
+     // Increment the ref count
+     ++backendContext->refCount;
+@@ -832,7 +819,8 @@ FfxErrorCode DestroyBackendContextDX11(FfxInterface* backendInterface, FfxUInt32
+         for (size_t i = 0; i < FFX_MAX_NUM_CONST_BUFFERS; ++i) {
+ 
+             if (backendContext->constantBufferResource[i] != NULL) {
+-                backendContext->deviceContext->Unmap(backendContext->constantBufferResource[i], 0);
++                if (backendContext->constantBufferMem[i])
++                    backendContext->deviceContext->Unmap(backendContext->constantBufferResource[i], 0);
+                 backendContext->constantBufferResource[i]->Release();
+                 backendContext->constantBufferResource[i] = NULL;
+                 backendContext->constantBufferMem[i] = nullptr;
+@@ -1488,8 +1476,9 @@ FfxErrorCode CreatePipelineDX11(
+     else
+     {
+         FfxShaderBlob shaderBlob = { };
+-        ffxGetPermutationBlobByIndex(effect, pass, FFX_BIND_COMPUTE_SHADER_STAGE, permutationOptions, &shaderBlob);
+-        FFX_ASSERT(shaderBlob.data && shaderBlob.size);
++        const auto blobResult = ffxGetPermutationBlobByIndex(effect, pass, FFX_BIND_COMPUTE_SHADER_STAGE, permutationOptions, &shaderBlob);
++        if (blobResult != FFX_OK) return blobResult;
++        if (!shaderBlob.data || !shaderBlob.size) return FFX_ERROR_BACKEND_API_ERROR;
+ 
+         // Only set the command signature if this is setup as an indirect workload
+         outPipeline->cmdSignature = nullptr;
+@@ -1604,12 +1593,25 @@ FfxErrorCode ScheduleGpuJobDX11(
+     const FfxGpuJobDescription* job
+ )
+ {
+-    FFX_ASSERT(NULL != backendInterface);
+-    FFX_ASSERT(NULL != job);
++    if (!backendInterface || !backendInterface->scratchBuffer || !job)
++        return FFX_ERROR_INVALID_POINTER;
+ 
+     BackendContext_DX11* backendContext = (BackendContext_DX11*)backendInterface->scratchBuffer;
+ 
+-    FFX_ASSERT(backendContext->gpuJobCount < FFX_MAX_GPU_JOBS);
++    const size_t capacity = size_t(backendContext->maxEffectContexts) * kDx11GpuJobsPerContext;
++    if (backendContext->pendingJobError != FFX_OK)
++        return backendContext->pendingJobError;
++    if (!backendContext->pGpuJobs || backendContext->gpuJobCount >= capacity)
++        return backendContext->pendingJobError = FFX_ERROR_INSUFFICIENT_MEMORY;
++    if (job->jobType == FFX_GPU_JOB_COMPUTE) {
++        const auto& compute = job->computeJobDescriptor;
++        if (compute.pipeline.constCount > FFX_MAX_NUM_CONST_BUFFERS)
++            return backendContext->pendingJobError = FFX_ERROR_INVALID_ARGUMENT;
++        for (uint32_t i = 0; i < compute.pipeline.constCount; ++i)
++            if (compute.cbs[i].num32BitEntries > FFX_MAX_CONST_SIZE ||
++                compute.pipeline.constantBufferBindings[i].slotIndex >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
++                return backendContext->pendingJobError = FFX_ERROR_INVALID_ARGUMENT;
++    }
+ 
+     backendContext->pGpuJobs[backendContext->gpuJobCount] = *job;
+ 
+@@ -1775,8 +1777,9 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX11* backendContext, Ff
+ 
+             uint32_t size = FFX_ALIGN_UP(job->computeJobDescriptor.cbs[currentRootConstantIndex].num32BitEntries * sizeof(uint32_t), 256);
+ 
+-            // Direct3D 11.0
+-            if (backendContext->deviceContext1 == NULL) {
++            // Legal on both D3D11.0 and D3D11.1: finish the CPU write before
++            // binding this resource for the GPU.
++            {
+ 
+                 if (backendContext->constantBufferSize[currentRootConstantIndex] < size) {
+ 
+@@ -1805,25 +1808,13 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX11* backendContext, Ff
+                         backendContext->deviceContext->Unmap(backendContext->constantBufferResource[currentRootConstantIndex], 0);
+                     }
+ 
+-                    dx11DeviceContext->CSSetConstantBuffers(currentRootConstantIndex, 1, &backendContext->constantBufferResource[currentRootConstantIndex]);
++                    const UINT slot = job->computeJobDescriptor.pipeline.constantBufferBindings[currentRootConstantIndex].slotIndex;
++                    dx11DeviceContext->CSSetConstantBuffers(slot, 1, &backendContext->constantBufferResource[currentRootConstantIndex]);
+                 }
+ 
+                 continue;
+             }
+ 
+-            if (backendContext->constantBufferOffset[0] + size >= backendContext->constantBufferSize[0])
+-                backendContext->constantBufferOffset[0] = 0;
+-
+-            void* pBuffer = (void*)((uint8_t*)(backendContext->constantBufferMem[0]) + backendContext->constantBufferOffset[0]);
+-            memcpy(pBuffer, job->computeJobDescriptor.cbs[currentRootConstantIndex].data, job->computeJobDescriptor.cbs[currentRootConstantIndex].num32BitEntries * sizeof(uint32_t));
+-
+-            uint32_t first = backendContext->constantBufferOffset[0] / sizeof(FfxFloat32x4);
+-            uint32_t num = size / sizeof(FfxFloat32x4);
+-
+-            backendContext->deviceContext1->CSSetConstantBuffers1(currentRootConstantIndex, 1, &backendContext->constantBufferResource[0], &first, &num);
+-
+-            // update the offset
+-            backendContext->constantBufferOffset[0] += size;
+         }
+     }
+ 
+@@ -1882,6 +1873,15 @@ FfxErrorCode ExecuteGpuJobsDX11(
+ 
+     BackendContext_DX11* backendContext = (BackendContext_DX11*)backendInterface->scratchBuffer;
+ 
++    // The effect may ignore individual schedule return codes. Never execute
++    // a truncated batch and report it as a valid optical-flow frame.
++    if (backendContext->pendingJobError != FFX_OK) {
++        const auto error = backendContext->pendingJobError;
++        backendContext->pendingJobError = FFX_OK;
++        backendContext->gpuJobCount = 0;
++        return error;
++    }
++
+     FfxErrorCode errorCode = FFX_OK;
+ 
+     // execute all GpuJobs

@@ -1,0 +1,17 @@
+FrameGen OpenXR layer build
+
+On macOS, install Python 3.9 or newer and an llvm-mingw toolchain. From
+this directory, run:
+
+  LLVM_MINGW_DIR=/path/to/llvm-mingw python3 build_portable.py
+
+You can pass the toolchain root or bin directory using --toolchain, or
+put the x86_64-w64-mingw32 toolchain on PATH. The script produces
+build/FrameGen.dll with Direct3D 11 and 12 support. Use --output to
+choose another destination, --debug to include debug symbols, or
+--no-native-d3d12 for a Direct3D 11-only build.
+
+The build uses the bundled AMD FidelityFX, Khronos OpenXR, and OFXR
+Bridge source subsets. Their licenses and notices are in vendor/.
+Shader bytecode is embedded in src/amd. The build uses no network,
+does not install the layer, and does not start a game or use the GPU.

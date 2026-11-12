@@ -1,0 +1,4 @@
+AMD FidelityFX SDK D3D11 OpticalFlow build subset
+Source https://github.com/ParticleTroned/FidelityFX-SDK-DX11
+Commit054f0ade7bd443710644ecb2564936281821f532
+Only compiler-discovered headers, four host translation units, shared blob declaration and DXBC checksum/MD5 sources retained. Original license notices preserved. Local backend changes described in root audit and captured in upstream-local.patch.
