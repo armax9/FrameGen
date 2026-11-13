@@ -1,21 +1,21 @@
 # FrameGen
 
-FrameGen adds 2× frame generation to compatible Windows VR games running in CrossOver on Apple silicon. The macOS menu bar app installs an OpenXR layer in the bottle you select and lets you switch generation on or off while the game is running.
+FrameGen adds 2× frame generation to compatible Windows VR games on Apple silicon. The macOS menu bar app installs an OpenXR layer in a CrossOver, CrossOver Preview, or MoltenVR-managed Wine bottle. You can switch generation on or off while the game is running.
 
 The layer uses AMD FidelityFX Optical Flow on the game's rendered stereo images. It supports Direct3D 11 and Direct3D 12 OpenXR sessions, including Direct3D 11 OpenVR games that use OpenComposite. At 72 Hz, the 2× mode aims for 36 game frames and 36 generated frames per second. The game still samples input at its own frame rate.
 
 ## Setup
 
-1. Start with a working MoltenVR setup and a VR game that already runs through D3DMetal in a CrossOver or CrossOver Preview bottle.
-2. Download [FrameGen 0.1.0](https://github.com/armax9/FrameGen/releases/tag/v0.1.0), extract the ZIP, and open `FrameGen.app`. Select the bottle that runs the game and choose **Install** or **Update** when offered. The app compares the installed layer with the version it bundles.
-3. Launch the game through its usual Steam VR launch option. Use your existing OpenComposite setup for an OpenVR game. The first launch after installing or updating loads the new layer.
+1. Set up MoltenVR and make sure your Windows VR game already runs in the bottle you plan to use. For a MoltenVR-managed bottle, create it in MoltenVR and let MoltenVR finish its Wine setup first.
+2. Extract the [release ZIP](https://github.com/armax9/FrameGen/releases) and open `FrameGen.app`. Pick the game's bottle in **Bottle**. The list identifies the provider next to each name. Choose **Install** or **Update** when offered.
+3. Launch the game in that same bottle through its usual VR launch option. Use your existing OpenComposite setup for an OpenVR game. The first launch after installing or updating loads the new layer.
 4. Turn **Frame Generation** on from the macOS menu bar. **Active** means the runtime has recently accepted a generated frame. **Waiting** means generation is enabled and a generated frame has yet to reach the runtime, which can happen during loading or on an incompatible scene. Check the app log when it reports an unsupported session.
 
 One switch applies to compatible sessions in the selected bottle. The installer registers an implicit OpenXR layer, so games keep their usual launch options, runtime, and mods. Set `DISABLE_ARMAX_FRAMEGEN=1` in the launch environment to bypass the layer for that launch.
 
 ## Compatibility tested so far
 
-These checks used CrossOver, D3DMetal, and MoltenVR. **Active** records acceptance of generated frames. Coverage varies by game and scene.
+The game checks below used CrossOver, D3DMetal, and MoltenVR. **Active** records acceptance of generated frames. Coverage varies by game and scene. In a MoltenVR-managed bottle, v0.1.1 was verified with a Direct3D 11/DXMT test scene that reached **Active**. Game compatibility in those bottles still needs verification.
 
 | Game | VR path | Verified and pending |
 | --- | --- | --- |
@@ -33,7 +33,7 @@ Some Unity games can hit a Direct3D 11 context limitation in D3DMetal. The Subna
 
 ## Source and credits
 
-FrameGen v0.1.0 is released under the GNU General Public License v3.0. Upstream components retain their own notices. Build instructions are in [BUILD.md](BUILD.md).
+FrameGen is released under the GNU General Public License v3.0. Upstream components retain their own notices. Build instructions are in [BUILD.md](BUILD.md).
 
 - The Windows layer builds on optical-flow synthesis and OpenXR work by tig3rmast3r and contributors. [OFXR Bridge](https://github.com/tig3rmast3r/OFXR-Bridge)
 - Frame scheduling and GPU resource ownership were informed by the work of eregnier and contributors. [ReproVR](https://github.com/eregnier/repro-vr)

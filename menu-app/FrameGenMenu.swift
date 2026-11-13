@@ -125,6 +125,38 @@ private struct Installation: Equatable {
     }
 }
 
+private struct Bottle: Equatable, Sendable {
+    enum Provider: String, Sendable {
+        case crossover, moltenvr
+
+        var title: String {
+            switch self {
+            case .crossover: return "CrossOver"
+            case .moltenvr: return "MoltenVR"
+            }
+        }
+    }
+
+    let provider: Provider
+    let name: String
+
+    var title: String { "\(name) · \(provider.title)" }
+    var arguments: [String] { ["--provider", provider.rawValue, "--bottle", name] }
+
+    init(provider: Provider, name: String) {
+        self.provider = provider
+        self.name = name
+    }
+
+    init?(record: Substring) {
+        let fields = record.split(separator: "\t", omittingEmptySubsequences: false)
+        guard fields.count == 2, let provider = Provider(rawValue: String(fields[0])), !fields[1].isEmpty else {
+            return nil
+        }
+        self.init(provider: provider, name: String(fields[1]))
+    }
+}
+
 private struct CommandResult: Sendable {
     let status: Int32
     let output: String
@@ -157,9 +189,9 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         .appendingPathComponent("Library/Logs/FrameGen.log")
     private let defaults = UserDefaults.standard
     private var crossoverPaths: [String] = []
-    private var bottles: [String] = []
+    private var bottles: [Bottle] = []
     private var crossover: String?
-    private var bottle: String?
+    private var bottle: Bottle?
     private var installation: Installation?
     private var activity: Activity?
     private var lastLoggedIssue: String?
@@ -175,7 +207,10 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         crossover = defaults.string(forKey: "SelectedCrossOver")
-        bottle = defaults.string(forKey: "SelectedBottle")
+        if let name = defaults.string(forKey: "SelectedBottle") {
+            let provider = defaults.string(forKey: "SelectedBottleProvider").flatMap(Bottle.Provider.init(rawValue:))
+            bottle = Bottle(provider: provider ?? .crossover, name: name)
+        }
         showControls()
         refresh()
         let timer = Timer(timeInterval: 1.5, target: self, selector: #selector(pollActivity),
@@ -214,7 +249,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         if controls.window.isMiniaturized { controls.window.deminiaturize(nil) }
         controls.window.makeKeyAndOrderFront(nil)
         renderMenu()
-        if let bottle, bottles.contains(bottle), !busy {
+        if hasBottle, !busy {
             poll(refreshInstallation: true)
         }
     }
@@ -251,8 +286,8 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         installRow.detachesHiddenViews = true
 
         let settings = NSGridView(views: [
-            [NSTextField(labelWithString: "CrossOver"), crossover],
             [NSTextField(labelWithString: "Bottle"), bottle],
+            [NSTextField(labelWithString: "CrossOver"), crossover],
         ])
         settings.column(at: 0).width = 74
         settings.column(at: 0).xPlacement = .trailing
@@ -304,29 +339,33 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
 
     private func refreshControls() {
         let view = controls
-        func fill(_ popup: NSPopUpButton, choices: [(String, String)], selected: String?, placeholder: String) {
-            popup.removeAllItems()
-            if choices.isEmpty || popup === view.crossover {
-                popup.addItem(withTitle: placeholder)
-            }
-            for (title, value) in choices {
-                popup.addItem(withTitle: "")
-                guard let row = popup.lastItem else { continue }
-                row.title = title
-                row.representedObject = value
-                if popup === view.crossover { row.toolTip = value }
-                if value == selected { popup.select(row) }
-            }
-            if popup.selectedItem == nil, popup.numberOfItems > 0 { popup.selectItem(at: 0) }
-            popup.isEnabled = !busy && !choices.isEmpty
+        view.bottle.removeAllItems()
+        if bottles.isEmpty { view.bottle.addItem(withTitle: "No bottles found") }
+        for choice in bottles {
+            view.bottle.addItem(withTitle: choice.title)
+            guard let row = view.bottle.lastItem else { continue }
+            row.representedObject = choice
+            if choice == bottle { view.bottle.select(row) }
         }
+        view.bottle.isEnabled = !busy && !bottles.isEmpty
 
-        fill(view.crossover, choices: crossoverPaths.map {
-            (URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent, $0)
-        }, selected: crossover, placeholder: "Automatic")
-        fill(view.bottle, choices: bottles.map { ($0, $0) },
-             selected: bottle, placeholder: "No bottles found")
-        view.install.isEnabled = !busy && hasBottle && !crossoverPaths.isEmpty
+        let usesCrossOver = bottle?.provider == .crossover
+        view.crossover.removeAllItems()
+        if usesCrossOver {
+            view.crossover.addItem(withTitle: "Automatic")
+            for path in crossoverPaths {
+                view.crossover.addItem(withTitle: "")
+                guard let row = view.crossover.lastItem else { continue }
+                row.title = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                row.representedObject = path
+                row.toolTip = path
+                if path == crossover { view.crossover.select(row) }
+            }
+        } else {
+            view.crossover.addItem(withTitle: hasBottle ? "Managed by MoltenVR" : "Select a bottle")
+        }
+        view.crossover.isEnabled = !busy && hasBottle && usesCrossOver && !crossoverPaths.isEmpty
+        view.install.isEnabled = !busy && hasBottle && (!usesCrossOver || !crossoverPaths.isEmpty)
         refreshStatusViews()
     }
 
@@ -346,7 +385,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         if let message {
             activityText = message
         } else if !hasBottle {
-            activityText = "No CrossOver bottle found"
+            activityText = "No CrossOver or MoltenVR bottles found"
         } else if installation == nil {
             activityText = activityUnavailable ? "Could not check the installation" : "Checking game status…"
         } else if installation?.state != .current {
@@ -419,7 +458,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
 
     @objc private func refresh() {
         guard !busy else { return }
-        begin("Finding CrossOver installations…")
+        begin("Finding bottles…")
         command(["crossovers"]) { [self] result in
             if result.succeeded {
                 crossoverPaths = lines(result.output)
@@ -428,19 +467,20 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
                     defaults.removeObject(forKey: "SelectedCrossOver")
                 }
             }
-            command(["bottles"]) { [self] result in
+            command(["bottles", "--provider", "all"]) { [self] result in
                 guard result.succeeded else {
                     bottles = []
                     bottle = nil
                     installation = nil
                     activity = nil
-                    finish("Could not find CrossOver bottles")
+                    finish("Could not find bottles")
                     return
                 }
-                bottles = lines(result.output).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+                bottles = result.output.split(whereSeparator: \.isNewline)
+                    .compactMap(Bottle.init(record:))
+                    .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
                 if !hasBottle {
-                    bottle = bottles.first
-                    defaults.set(bottle, forKey: "SelectedBottle")
+                    setBottle(bottles.first)
                 }
                 loadStatus()
             }
@@ -477,7 +517,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
             finish()
             return
         }
-        command(["status", "--bottle", bottle]) { [self] result in
+        command(["status"] + bottle.arguments) { [self] result in
             guard updateStatus(result) else {
                 installation = nil
                 activity = nil
@@ -490,7 +530,12 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     @objc private func pollActivity() {
-        if installation?.state == .current { poll(refreshInstallation: false) }
+        switch installation?.state {
+        case .current: poll(refreshInstallation: false)
+        // Wine may report the registry write before persisting system.reg.
+        case .partial: poll(refreshInstallation: true)
+        default: break
+        }
     }
 
     private func poll(refreshInstallation: Bool) {
@@ -498,7 +543,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         polling = true
         let checkInstallation = refreshInstallation || installation == nil
         let operation = checkInstallation ? "status" : "activity"
-        command([operation, "--bottle", bottle], record: false) { [self] result in
+        command([operation] + bottle.arguments, record: false) { [self] result in
             polling = false
             guard self.bottle == bottle, !busy else { return }
             let oldInstallation = installation
@@ -521,28 +566,34 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     @objc private func changeCrossOver(_ sender: NSPopUpButton) {
-        guard !busy else { return }
+        guard !busy, bottle?.provider == .crossover else { return }
         crossover = sender.selectedItem?.representedObject as? String
         defaults.set(crossover, forKey: "SelectedCrossOver")
     }
 
-    @objc private func changeBottle(_ sender: NSPopUpButton) {
-        guard !busy, let name = sender.selectedItem?.representedObject as? String,
-              bottles.contains(name), name != bottle else { return }
-        bottle = name
+    private func setBottle(_ choice: Bottle?) {
+        bottle = choice
         installation = nil
         activity = nil
         activityUnavailable = false
-        defaults.set(name, forKey: "SelectedBottle")
-        begin("Checking \(name)…")
+        lastLoggedIssue = nil
+        defaults.set(choice?.name, forKey: "SelectedBottle")
+        defaults.set(choice?.provider.rawValue, forKey: "SelectedBottleProvider")
+    }
+
+    @objc private func changeBottle(_ sender: NSPopUpButton) {
+        guard !busy, let choice = sender.selectedItem?.representedObject as? Bottle,
+              bottles.contains(choice), choice != bottle else { return }
+        setBottle(choice)
+        begin("Checking \(choice.name)…")
         loadStatus()
     }
 
     @objc private func install() {
         guard !busy, let bottle else { return }
-        let crossoverArguments = crossover.map { ["--crossover", $0] } ?? []
+        let crossoverArguments = bottle.provider == .crossover ? crossover.map { ["--crossover", $0] } ?? [] : []
         begin("Installing FrameGen…")
-        command(["install", "--bottle", bottle] + crossoverArguments) { [self] result in
+        command(["install"] + bottle.arguments + crossoverArguments) { [self] result in
             if result.succeeded {
                 loadStatus()
             } else {
@@ -555,7 +606,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         guard !busy, let bottle, installation?.state == .current, let activity else { return }
         let mode = activity.enabled ? "off" : "on"
         begin("Turning Frame Generation \(mode)…")
-        command(["mode", "--bottle", bottle, "--mode", mode]) { [self] result in
+        command(["mode"] + bottle.arguments + ["--mode", mode]) { [self] result in
             if result.succeeded {
                 loadStatus()
             } else {

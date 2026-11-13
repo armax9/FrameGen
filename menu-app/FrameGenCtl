@@ -6,6 +6,7 @@ line() { [[ "$1" != *[$'\t\r\n']* ]]; }
 
 resources=${0:A:h}
 crossover_home="$HOME/Library/Application Support/CrossOver"
+moltenvr_home="$HOME/Library/Application Support/MoltenVR"
 runtime_key='HKLM\Software\Khronos\OpenXR\1'
 implicit_key="$runtime_key\ApiLayers\Implicit"
 win_manifest='C:\FrameGen\FrameGen.json'
@@ -31,42 +32,77 @@ if [[ -z "$configured_roots" && -r "$crossover_home/CrossOver.conf" ]]; then
       sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*$/, ""); print; exit
     }' "$crossover_home/CrossOver.conf")
 fi
-bottle_roots=("${(@s.:.)configured_roots}" "$crossover_home/Bottles")
+crossover_roots=("${(@s.:.)configured_roots}" "$crossover_home/Bottles")
 
-valid_bottle() { [[ -d "$1/drive_c" && -r "$1/cxbottle.conf" ]]; }
+valid_bottle() {
+  [[ -d "$2/drive_c" ]] || return 1
+  case "$1" in
+    crossover) [[ -r "$2/cxbottle.conf" ]] ;;
+    moltenvr) [[ -r "$2/.moltenvr_wine" && -r "$2/system.reg" ]] ;;
+  esac
+}
 
-bottles() {
-  local root entry name
+bottle_roots() {
+  case "$1" in
+    crossover) printf '%s\n' "${crossover_roots[@]}" ;;
+    moltenvr) print -r -- "$moltenvr_home/Bottles" ;;
+  esac
+}
+
+list_bottles() {
+  local kind=$1 include_provider=${2:-0} root entry name
   typeset -A seen
-  for root in "${bottle_roots[@]}"; do
+  while IFS= read -r root; do
     [[ "$root" == /* ]] || continue
     for entry in "$root"/*(N); do
       name=${entry:t}
-      if line "$name" && valid_bottle "$entry" && [[ -z ${seen[$name]:-} ]]; then
+      if line "$name" && valid_bottle "$kind" "$entry" && [[ -z ${seen[$name]:-} ]]; then
         seen[$name]=1
-        print -r -- "$name"
+        if (( include_provider )); then
+          printf '%s\t%s\n' "$kind" "$name"
+        else
+          print -r -- "$name"
+        fi
       fi
     done
-  done
+  done < <(bottle_roots "$kind")
+}
+
+bottles() {
+  if [[ "$provider" == all ]]; then
+    list_bottles crossover 1
+    list_bottles moltenvr 1
+  else
+    list_bottles "$provider"
+  fi
 }
 
 select_bottle() {
   local root
+  [[ "$provider" != all ]] || fail 'Select a single bottle provider.'
   [[ -n "$bottle" && "$bottle" != */* && "$bottle" != . && "$bottle" != .. ]] && line "$bottle" ||
-    fail 'Select a CrossOver bottle.'
-  for root in "${bottle_roots[@]}"; do
-    if [[ "$root" == /* ]] && valid_bottle "$root/$bottle"; then
+    fail 'Select a bottle.'
+  while IFS= read -r root; do
+    if [[ "$root" == /* ]] && valid_bottle "$provider" "$root/$bottle"; then
       prefix=${root%/}/$bottle
       prefix=${prefix:A}
       target="$prefix/drive_c/FrameGen"
       return
     fi
-  done
-  fail "CrossOver bottle not found: $bottle"
+  done < <(bottle_roots "$provider")
+  fail "Bottle not found ($provider): $bottle"
 }
 
 select_wine() {
   local chosen
+  if [[ "$provider" == moltenvr ]]; then
+    wine=$(<"$prefix/.moltenvr_wine")
+    line "$wine" && [[ "$wine" == /* && ( "${wine:t}" == wine || "${wine:t}" == wine64 ) && -x "$wine" ]] ||
+      fail 'MoltenVR Wine is unavailable. Open this bottle in MoltenVR to set up its Wine runtime.'
+    wineserver="${wine:h}/wineserver"
+    [[ -x "$wineserver" ]] || fail 'The MoltenVR Wine server was not found.'
+    return
+  fi
   if [[ -z "$crossover" ]]; then
     chosen=$(crossovers)
     crossover=${chosen%%$'\n'*}
@@ -78,7 +114,12 @@ select_wine() {
 
 reg() (
   unset WINEDLLOVERRIDES
-  "$wine" --bottle "$prefix" --scope private reg.exe "$@"
+  if [[ "$provider" == moltenvr ]]; then
+    unset WINEARCH WINELOADER WINEDLLPATH
+    WINEPREFIX="$prefix" WINESERVER="$wineserver" WINEDEBUG=-all "$wine" reg.exe "$@"
+  else
+    "$wine" --bottle "$prefix" --scope private reg.exe "$@"
+  fi
 )
 
 prepare_layout() {
@@ -178,7 +219,7 @@ install_layer() (
     if [[ -f "$target/$item" ]]; then /bin/cp -p "$target/$item" "$stage/prior-$item"; fi
   done
   if (( ! registered )) && previous=$(reg query "$implicit_key" /v "$win_manifest" 2>/dev/null); then
-    previous_value=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { print $NF; exit }')
+    previous_value=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { sub(/\r$/, ""); print $NF; exit }')
     [[ "$previous_value" =~ '^(0x[0-9a-fA-F]+|[0-9]+)$' ]] ||
       fail 'An incompatible FrameGen registry value already exists.'
   fi
@@ -191,7 +232,7 @@ install_layer() (
       fail 'Could not register the implicit OpenXR layer.'
     previous=$(reg query "$implicit_key" /v "$win_manifest") ||
       fail 'Could not verify the OpenXR registration.'
-    previous=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { print $NF; exit }')
+    previous=$(print -r -- "$previous" | /usr/bin/awk '/REG_DWORD/ { sub(/\r$/, ""); print $NF; exit }')
     [[ "$previous" =~ '^(0x)?0+$' ]] || fail 'Could not verify the enabled OpenXR registration.'
   fi
   committed=1
@@ -276,17 +317,24 @@ read_activity() {
 operation=${1:-}
 [[ -n "$operation" ]] || fail 'Choose a FrameGen command.'
 shift
-bottle='' crossover='' requested_mode=''
+bottle='' crossover='' requested_mode='' provider=crossover
 while (( $# )); do
   (( $# >= 2 )) || fail "Missing value for $1."
   case "$1" in
     --bottle) bottle=$2 ;;
     --crossover) crossover=$2 ;;
+    --provider) provider=$2 ;;
     --mode) requested_mode=$2 ;;
     *) fail "Unknown option: $1" ;;
   esac
   shift 2
 done
+
+case "$provider" in
+  crossover|moltenvr) ;;
+  all) [[ "$operation" == bottles ]] || fail 'Select a single bottle provider.' ;;
+  *) fail "Unknown bottle provider: $provider" ;;
+esac
 
 case "$operation" in
   bottles) bottles ;;

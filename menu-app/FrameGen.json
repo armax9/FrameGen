@@ -4,8 +4,8 @@
     "name": "XR_APILAYER_ARMAX_framegen",
     "library_path": ".\\FrameGen.dll",
     "api_version": "1.0",
-    "implementation_version": "14",
-    "description": "FrameGen for OpenXR on CrossOver",
+    "implementation_version": "15",
+    "description": "FrameGen for OpenXR on Apple silicon",
     "disable_environment": "DISABLE_ARMAX_FRAMEGEN"
   }
 }
