@@ -139,21 +139,27 @@ private struct Bottle: Equatable, Sendable {
 
     let provider: Provider
     let name: String
+    let path: String?
 
     var title: String { "\(name) · \(provider.title)" }
-    var arguments: [String] { ["--provider", provider.rawValue, "--bottle", name] }
+    var arguments: [String] {
+        ["--provider", provider.rawValue] + (path.map { ["--bottle-path", $0] } ?? ["--bottle", name])
+    }
 
-    init(provider: Provider, name: String) {
+    init(provider: Provider, name: String, path: String? = nil) {
         self.provider = provider
         self.name = name
+        self.path = path
     }
 
     init?(record: Substring) {
         let fields = record.split(separator: "\t", omittingEmptySubsequences: false)
-        guard fields.count == 2, let provider = Provider(rawValue: String(fields[0])), !fields[1].isEmpty else {
+        guard (2...3).contains(fields.count), let provider = Provider(rawValue: String(fields[0])), !fields[1].isEmpty else {
             return nil
         }
-        self.init(provider: provider, name: String(fields[1]))
+        let path = fields.count == 3 ? String(fields[2]) : nil
+        guard path == nil || (provider == .moltenvr && path?.hasPrefix("/") == true) else { return nil }
+        self.init(provider: provider, name: String(fields[1]), path: path)
     }
 }
 
@@ -209,10 +215,10 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         crossover = defaults.string(forKey: "SelectedCrossOver")
         if let name = defaults.string(forKey: "SelectedBottle") {
             let provider = defaults.string(forKey: "SelectedBottleProvider").flatMap(Bottle.Provider.init(rawValue:))
-            bottle = Bottle(provider: provider ?? .crossover, name: name)
+            bottle = Bottle(provider: provider ?? .crossover, name: name,
+                            path: defaults.string(forKey: "SelectedBottlePath"))
         }
         showControls()
-        refresh()
         let timer = Timer(timeInterval: 1.5, target: self, selector: #selector(pollActivity),
                           userInfo: nil, repeats: true)
         timer.tolerance = 0.25
@@ -249,9 +255,7 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         if controls.window.isMiniaturized { controls.window.deminiaturize(nil) }
         controls.window.makeKeyAndOrderFront(nil)
         renderMenu()
-        if hasBottle, !busy {
-            poll(refreshInstallation: true)
-        }
+        refresh()
     }
 
     private func makeControls() -> Controls {
@@ -337,14 +341,22 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         bottle.map(bottles.contains) ?? false
     }
 
+    private func bottleTitle(_ choice: Bottle) -> String {
+        guard bottles.contains(where: { $0.title == choice.title && $0 != choice }),
+              let path = choice.path else { return choice.title }
+        let parent = (path as NSString).deletingLastPathComponent
+        return "\(choice.title) — \((parent as NSString).abbreviatingWithTildeInPath)"
+    }
+
     private func refreshControls() {
         let view = controls
         view.bottle.removeAllItems()
         if bottles.isEmpty { view.bottle.addItem(withTitle: "No bottles found") }
         for choice in bottles {
-            view.bottle.addItem(withTitle: choice.title)
+            view.bottle.addItem(withTitle: bottleTitle(choice))
             guard let row = view.bottle.lastItem else { continue }
             row.representedObject = choice
+            row.toolTip = choice.path
             if choice == bottle { view.bottle.select(row) }
         }
         view.bottle.isEnabled = !busy && !bottles.isEmpty
@@ -430,6 +442,20 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         menu.addItem(generation)
         menu.addItem(activity)
         menu.addItem(installation)
+        let bottlePicker = NSMenuItem(title: bottle.map { "Bottle · \($0.title)" } ?? "Bottle",
+                                      action: nil, keyEquivalent: "")
+        let bottleMenu = NSMenu()
+        bottleMenu.autoenablesItems = false
+        for choice in bottles {
+            let row = menuItem(bottleTitle(choice), action: #selector(selectMenuBottle(_:)), enabled: !busy)
+            row.representedObject = choice
+            row.toolTip = choice.path
+            row.state = choice == bottle ? .on : .off
+            bottleMenu.addItem(row)
+        }
+        if bottles.isEmpty { bottleMenu.addItem(menuItem("No bottles found")) }
+        bottlePicker.submenu = bottleMenu
+        menu.addItem(bottlePicker)
         menu.addItem(.separator())
         menu.addItem(menuItem("Open FrameGen…", action: #selector(showControls)))
         menu.addItem(menuItem("Refresh", action: #selector(refresh), enabled: !busy))
@@ -480,7 +506,9 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
                     .compactMap(Bottle.init(record:))
                     .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
                 if !hasBottle {
-                    setBottle(bottles.first)
+                    let prior = bottle
+                    let migrated = bottles.first { $0.provider == prior?.provider && $0.name == prior?.name }
+                    setBottle(migrated ?? bottles.first)
                 }
                 loadStatus()
             }
@@ -579,10 +607,19 @@ private final class MenuController: NSObject, NSApplicationDelegate, NSWindowDel
         lastLoggedIssue = nil
         defaults.set(choice?.name, forKey: "SelectedBottle")
         defaults.set(choice?.provider.rawValue, forKey: "SelectedBottleProvider")
+        defaults.set(choice?.path, forKey: "SelectedBottlePath")
     }
 
     @objc private func changeBottle(_ sender: NSPopUpButton) {
-        guard !busy, let choice = sender.selectedItem?.representedObject as? Bottle,
+        selectBottle(sender.selectedItem?.representedObject as? Bottle)
+    }
+
+    @objc private func selectMenuBottle(_ sender: NSMenuItem) {
+        selectBottle(sender.representedObject as? Bottle)
+    }
+
+    private func selectBottle(_ choice: Bottle?) {
+        guard !busy, let choice,
               bottles.contains(choice), choice != bottle else { return }
         setBottle(choice)
         begin("Checking \(choice.name)…")

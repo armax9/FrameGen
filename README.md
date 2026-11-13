@@ -11,7 +11,7 @@ The layer uses AMD FidelityFX Optical Flow on the game's rendered stereo images.
 3. Launch the game in that same bottle through its usual VR launch option. Use your existing OpenComposite setup for an OpenVR game. The first launch after installing or updating loads the new layer.
 4. Turn **Frame Generation** on from the macOS menu bar. **Active** means the runtime has recently accepted a generated frame. **Waiting** means generation is enabled and a generated frame has yet to reach the runtime, which can happen during loading or on an incompatible scene. Check the app log when it reports an unsupported session.
 
-One switch applies to compatible sessions in the selected bottle. The installer registers an implicit OpenXR layer, so games keep their usual launch options, runtime, and mods. Set `DISABLE_ARMAX_FRAMEGEN=1` in the launch environment to bypass the layer for that launch.
+Switch between bottles from the **Bottle** submenu in the macOS menu bar or from the app window. FrameGen also checks additional bottle folders configured in MoltenVR. Use **Refresh** after creating a bottle while FrameGen is open. One switch applies to compatible sessions in the selected bottle. The installer registers an implicit OpenXR layer, so games keep their usual launch options, runtime, and mods. Set `DISABLE_ARMAX_FRAMEGEN=1` in the launch environment to bypass the layer for that launch.
 
 ## Compatibility tested so far
 
@@ -21,7 +21,7 @@ The game checks below used CrossOver, D3DMetal, and MoltenVR. **Active** records
 | --- | --- | --- |
 | Euro Truck Simulator 2 | Direct3D 11, native OpenXR | Generation and both live toggle directions worked in the cab with the earlier standalone build. The final menu bar release still needs a fresh cab check. |
 | DiRT Rally 2.0 | Direct3D 11, OpenVR through OpenComposite | Generation and live switching worked in the VR menu. Earlier in-race tests showed artifacts and headset interruptions. Race verification is pending. |
-| Subnautica | Direct3D 11, OpenVR through OpenComposite | Generation reached Active in the menu with a local D3DMetal Unity compatibility repair. The tested build also had headset interruptions. Full gameplay verification is pending. |
+| Subnautica | Direct3D 11, OpenVR through OpenComposite | Frame generation worked during gameplay in the user test. |
 | The Elder Scrolls V: Skyrim VR | Direct3D 11, OpenVR through OpenComposite | Generation reached Active in a short user test. |
 | MADiSON VR | Direct3D 11, native OpenXR | Generation reached Active in a short VR test. |
 | Escape Simulator 2 | Direct3D 11, native OpenXR | Generation reached Active with the two-eye texture array used by the Steam VR launch. A forced Direct3D 12 run fell back to Direct3D 11. |
@@ -29,7 +29,7 @@ The game checks below used CrossOver, D3DMetal, and MoltenVR. **Active** records
 
 In Red Matter 2, moving the menu quad to the GPU reduced the measured MoltenVR frame submission time from about 31 ms to about 3 ms in the tested menu. Performance and image quality can vary across scenes. Direct3D 12 verification currently covers Red Matter 2.
 
-Some Unity games can hit a Direct3D 11 context limitation in D3DMetal. The Subnautica check used a local repair for Game Porting Toolkit 4.0 beta 3. That driver repair is separate from FrameGen. The release contains FrameGen and its redistributable dependencies. Obtain CrossOver, D3DMetal, MoltenVR, and games separately.
+The release contains FrameGen and its redistributable dependencies. Obtain CrossOver, D3DMetal, MoltenVR, and games separately.
 
 ## Source and credits
 

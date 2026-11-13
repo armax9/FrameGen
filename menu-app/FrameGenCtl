@@ -22,8 +22,7 @@ crossovers() {
   done
 }
 
-typeset -a bottle_roots
-typeset -U bottle_roots
+typeset -aU crossover_roots
 configured_roots=${CX_BOTTLE_PATH:-}
 if [[ -z "$configured_roots" && -r "$crossover_home/CrossOver.conf" ]]; then
   configured_roots=$(/usr/bin/awk '
@@ -38,34 +37,53 @@ valid_bottle() {
   [[ -d "$2/drive_c" ]] || return 1
   case "$1" in
     crossover) [[ -r "$2/cxbottle.conf" ]] ;;
-    moltenvr) [[ -r "$2/.moltenvr_wine" && -r "$2/system.reg" ]] ;;
+    moltenvr) [[ -r "$2/system.reg" && ! -e "$2/cxbottle.conf" ]] ;;
   esac
 }
 
-bottle_roots() {
-  case "$1" in
-    crossover) printf '%s\n' "${crossover_roots[@]}" ;;
-    moltenvr) print -r -- "$moltenvr_home/Bottles" ;;
-  esac
+moltenvr_external_roots() {
+  local domain data path index
+  for domain in dev.moltenvr.preview dev.moltenvr.app; do
+    data=$(/usr/bin/plutil -extract extraBottleDirs raw -o - \
+      "$HOME/Library/Preferences/$domain.plist" 2>/dev/null | /usr/bin/base64 -D) || continue
+    [[ -n "$data" ]] || continue
+    index=0
+    while path=$(print -r -- "$data" | /usr/bin/plutil -extract "$index" raw -expect string -o - - 2>/dev/null); do
+      if [[ "$path" == /* ]] && line "$path"; then print -r -- "$path"; fi
+      index=$(( index + 1 ))
+    done
+  done
 }
 
 list_bottles() {
-  local kind=$1 include_provider=${2:-0} root entry name
+  local kind=$1 include_provider=${2:-0} root entry name canonical key
+  local -a roots
   typeset -A seen
-  while IFS= read -r root; do
-    [[ "$root" == /* ]] || continue
+  if [[ "$kind" == crossover ]]; then
+    roots=("${crossover_roots[@]}")
+  else
+    roots=("$moltenvr_home/Bottles" "${(@f)$(moltenvr_external_roots)}")
+  fi
+  for root in "${roots[@]}"; do
+    [[ "$root" == /* && -d "$root" ]] || continue
     for entry in "$root"/*(N); do
       name=${entry:t}
-      if line "$name" && valid_bottle "$kind" "$entry" && [[ -z ${seen[$name]:-} ]]; then
-        seen[$name]=1
-        if (( include_provider )); then
-          printf '%s\t%s\n' "$kind" "$name"
-        else
-          print -r -- "$name"
-        fi
+      valid_bottle "$kind" "$entry" || continue
+      canonical=${entry:A}
+      line "$name" && line "$canonical" || continue
+      key=$name
+      if [[ "$kind" == moltenvr ]]; then key=$canonical; fi
+      [[ -z ${seen[$key]:-} ]] || continue
+      seen[$key]=1
+      if (( include_provider )) && [[ "$kind" == moltenvr ]]; then
+        printf '%s\t%s\t%s\n' "$kind" "$name" "$canonical"
+      elif (( include_provider )); then
+        printf '%s\t%s\n' "$kind" "$name"
+      else
+        print -r -- "$name"
       fi
     done
-  done < <(bottle_roots "$kind")
+  done
 }
 
 bottles() {
@@ -78,30 +96,63 @@ bottles() {
 }
 
 select_bottle() {
-  local root
+  local root match='' kind name path
   [[ "$provider" != all ]] || fail 'Select a single bottle provider.'
+  if [[ -n "$bottle_path" ]]; then
+    [[ "$provider" == moltenvr && "$bottle_path" == /* ]] && line "$bottle_path" &&
+      valid_bottle moltenvr "$bottle_path" || fail 'MoltenVR bottle folder is unavailable.'
+    prefix=${bottle_path:A}
+    target="$prefix/drive_c/FrameGen"
+    return
+  fi
   [[ -n "$bottle" && "$bottle" != */* && "$bottle" != . && "$bottle" != .. ]] && line "$bottle" ||
     fail 'Select a bottle.'
-  while IFS= read -r root; do
+  if [[ "$provider" == moltenvr ]]; then
+    while IFS=$'\t' read -r kind name path; do
+      [[ "$name" == "$bottle" ]] || continue
+      [[ -z "$match" ]] || fail "Multiple MoltenVR bottles are named $bottle. Select one by path."
+      match=$path
+    done < <(list_bottles moltenvr 1)
+    if [[ -n "$match" ]]; then
+      prefix=$match
+      target="$prefix/drive_c/FrameGen"
+      return
+    fi
+    fail "Bottle not found ($provider): $bottle"
+  fi
+  for root in "${crossover_roots[@]}"; do
     if [[ "$root" == /* ]] && valid_bottle "$provider" "$root/$bottle"; then
       prefix=${root%/}/$bottle
       prefix=${prefix:A}
       target="$prefix/drive_c/FrameGen"
       return
     fi
-  done < <(bottle_roots "$provider")
+  done
   fail "Bottle not found ($provider): $bottle"
 }
 
 select_wine() {
-  local chosen
+  local chosen candidate domain runner
   if [[ "$provider" == moltenvr ]]; then
-    wine=$(<"$prefix/.moltenvr_wine")
-    line "$wine" && [[ "$wine" == /* && ( "${wine:t}" == wine || "${wine:t}" == wine64 ) && -x "$wine" ]] ||
-      fail 'MoltenVR Wine is unavailable. Open this bottle in MoltenVR to set up its Wine runtime.'
-    wineserver="${wine:h}/wineserver"
-    [[ -x "$wineserver" ]] || fail 'The MoltenVR Wine server was not found.'
-    return
+    local -a configured
+    for domain in dev.moltenvr.preview dev.moltenvr.app; do
+      candidate=$(/usr/bin/plutil -extract winePath raw -expect string -o - \
+        "$HOME/Library/Preferences/$domain.plist" 2>/dev/null) || continue
+      configured+=("$candidate")
+    done
+    configured+=("$moltenvr_home/wine/Libraries/Wine/bin/wine64" "$moltenvr_home/wine/Libraries/Wine/bin/wine"
+      "$moltenvr_home/wine-d3dmetal/bin/wine64" "$moltenvr_home/wine-d3dmetal/bin/wine")
+    runner=''
+    if [[ -r "$prefix/.moltenvr_wine" ]]; then runner=$(<"$prefix/.moltenvr_wine"); fi
+    if [[ "$runner" != /* || ! -x "$runner" ]]; then runner=''; fi
+    for candidate in "${configured[@]}"; do
+      line "$candidate" && [[ "$candidate" == /* && -x "$candidate" ]] || continue
+      if [[ -n "$runner" && "${runner:A}" != "${candidate:A}" ]]; then continue; fi
+      wine=$candidate
+      wineserver="${wine:h}/wineserver"
+      if [[ -x "$wineserver" ]]; then return 0; fi
+    done
+    fail 'MoltenVR Wine is unavailable for this bottle. Check the Wine path in MoltenVR settings.'
   fi
   if [[ -z "$crossover" ]]; then
     chosen=$(crossovers)
@@ -317,11 +368,12 @@ read_activity() {
 operation=${1:-}
 [[ -n "$operation" ]] || fail 'Choose a FrameGen command.'
 shift
-bottle='' crossover='' requested_mode='' provider=crossover
+bottle='' bottle_path='' crossover='' requested_mode='' provider=crossover
 while (( $# )); do
   (( $# >= 2 )) || fail "Missing value for $1."
   case "$1" in
     --bottle) bottle=$2 ;;
+    --bottle-path) bottle_path=$2 ;;
     --crossover) crossover=$2 ;;
     --provider) provider=$2 ;;
     --mode) requested_mode=$2 ;;
